@@ -1,0 +1,208 @@
+# KHÔI LỖI TÔNG MÔN THỨ HAI — chạy trên runner của GitHub, song song với khôi lỗi trên VM.
+#
+# CHỖ ĐẶT TỆP NÀY LÀ MỘT LUẬT, không phải một chỗ tuỳ tiện (13/08/2026): **kho nào giữ MÃ NGUỒN
+# thì không chạy nó.** Workflow này nằm trong `.github/workflows/` của một kho khôi lỗi dùng rồi
+# bỏ, và chỉ ở đó. Lý do: nó đòi `WORKER_TOKEN` — chìa TOÀN CỤC, mở cookie của MỌI thành viên —
+# nằm trong Secrets của kho chạy nó, và nó đổ nhật ký vĩnh viễn, ai cũng đọc được, của một tiến
+# trình chuyên cầm cookie đã giải mã. Đặt cả hai thứ ấy lên một kho dùng rồi bỏ thì mất một kho
+# dùng rồi bỏ; đặt lên kho mã nguồn thì mất kho mã nguồn.
+#
+# PHỐI HỢP VỚI VM: không có cơ chế điều phối nào ở đây, và đó là chủ ý — Postgres đã phân xử
+# sẵn. `claimNextJob` là MỘT câu UPDATE nguyên tử: hai khôi lỗi giành nhau thì nhận hai dòng
+# khác nhau, hoặc một dòng và một null. Cộng index `jobs_one_active_per_account`, hai đàn cùng
+# một tài khoản là bất khả thi về cấu trúc. Thêm một tầng "chia việc" ở đây chỉ là dựng một
+# luật thứ hai sống lệch luật thật.
+#
+# BA THỨ PHẢI ĐÚNG, và cả ba đều nằm ở dưới dạng con số:
+#
+#   1. WORKER_ID phải KHÁC VM (`tong-mon-khoiloi`). Trùng tên thì hai tiến trình ghi đè nhau
+#      trong bảng `workers`, và mục Khôi Lỗi trên dashboard nói dối về việc ai đang trực.
+#
+#   2. Tuổi thọ phải NGẮN HƠN trần của nền tảng. Runner bị giết cứng ở 6 giờ; giết giữa một ván
+#      Mê Cung 35 phút thì nhịp tim tắt và `reapStaleJobs` kết liễu đàn ấy sau 3 phút. Nên:
+#        thôi nhận việc ở phút 290 → chờ thu đàn tối đa 50 phút → 340 < 350 (timeout của job)
+#        < 360 (trần nền tảng). Hai lớp đệm, mỗi lớp 10 phút.
+#
+#   3. Lịch phải DÀY HƠN tuổi thọ. 4 giờ một lần trong khi một lượt sống ~4,8 giờ, nên lượt kế
+#      đã nằm chờ sẵn trong hàng đợi lúc lượt cũ thu đàn — `concurrency` giữ đúng một lượt chạy
+#      và một lượt chờ, nên hai lượt không bao giờ chồng nhau mà khoảng hở giữa chúng gần bằng 0.
+#
+# SỨC CHỨA: runner 4 nhân/16GB. Đo trên VM 4 vCPU ngày 10/08/2026: 8 ghế → load 14 và đàn hỏng
+# vì timeout; 5 ghế → load ~2. Runner có ít RAM hơn và chia sẻ I/O nên lấy 2 ghế, dè dặt có chủ
+# ý — VM vẫn là chỗ gánh chính, đây là phần cộng thêm.
+#
+# CÀI ĐẶT — một việc, và lượt dựng tự động đã làm sẵn: Settings → Secrets and variables →
+# Actions, thêm `WORKER_TOKEN` đúng giá trị đang đặt trên Vercel. Chỉ phải làm tay khi dựng kho
+# bằng tay. Thiếu nó thì bước cuối dừng ngay với một câu nói rõ, không chạy rỗng rồi để người ta
+# đoán.
+
+name: Khôi lỗi tông môn (GitHub)
+
+on:
+  schedule:
+    # Xem điều 3 ở trên: dày hơn tuổi thọ để lượt kế đã chờ sẵn khi lượt cũ rút lui.
+    - cron: "0 */4 * * *"
+  workflow_dispatch:
+    inputs:
+      tuoi_tho_ms:
+        # CHỈ để nghiệm phép nối chuỗi: bước cuối nằm sau worker, nên muốn thấy chuỗi chạy
+        # thật thì phải cho lượt kết thúc sớm. Lượt theo cron KHÔNG bao giờ nhận input nên
+        # luôn rơi về mặc định — hạ nó không chạm được production.
+        description: "Tuổi thọ (ms) — để trống là dùng mặc định 290 phút"
+        required: false
+        default: ""
+
+# Đúng MỘT khôi lỗi GitHub tại một thời điểm. `cancel-in-progress: false` là bắt buộc: huỷ lượt
+# đang chạy nghĩa là cắt ngang đàn đang cày, đúng thứ cả thiết kế này sinh ra để tránh.
+concurrency:
+  group: linh-su-github
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  # Đủ để POST .../actions/workflows/<tệp>/dispatches — xem bước「Phát lượt kế」ở cuối.
+  actions: write
+
+jobs:
+  linh-su:
+    runs-on: ubuntu-latest
+    # 350 phút: để timeout của GitHub bắn TRƯỚC trần 6 giờ của nền tảng, nên lượt chạy kết thúc
+    # bằng một dòng đỏ đọc được thay vì biến mất không lời giải thích.
+    timeout-minutes: 350
+    steps:
+      # Mốc giờ cho phanh chống vòng lặp ở bước cuối. Đặt TRƯỚC mọi thứ để nó tính cả thời
+      # gian cài đặt — một lượt chết ngay lúc `npm ci` cũng phải bị phanh giữ lại.
+      - name: Đánh dấu giờ bắt đầu
+        run: echo "BAT_DAU_LUC=$(date +%s)" >> "$GITHUB_ENV"
+
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+
+      - run: npm ci
+
+      # Chỉ Chromium — cùng lý do với workflow usage: mặc định Playwright kéo cả Firefox lẫn
+      # WebKit, tức vài phút mỗi lượt cho hai thứ không ai dùng. `--with-deps` cài thư viện hệ
+      # thống mà Chromium cần trên runner sạch.
+      - run: npx playwright install --with-deps chromium
+
+      # ── OBSCURA: trình duyệt thứ hai, dùng khi trang Tông Môn chọn nó ─────────────────────
+      #
+      # Tải mỗi lượt thay vì đóng vào kho: kho khôi lỗi là bản sao ĐÔNG LẠNH của mã nguồn, nhét
+      # 82 MB binary vào đó là mỗi lượt `github:deploy` phải đẩy lại từng ấy byte qua Git Data API.
+      # Runner tải nó trong khoảng chục giây, một lần cho cả ca trực 290 phút.
+      #
+      # `continue-on-error` KHÔNG phải sự cẩu thả: lựa chọn trình duyệt nằm ở app_settings và có
+      # thể đang là「chromium」, lúc ấy binary này không ai dùng tới. Một lượt tải trượt (GitHub
+      # release đứt mạng, đổi tag) mà giết cả ca trực là đổi một tiện nghi lấy nguyên một đội hình.
+      # Thiếu nó thì engine tự lui về Chromium và nói rõ trong nhật ký.
+      - name: Lấy Obscura
+        continue-on-error: true
+        env:
+          # Ghim tag: một bản mới lặng lẽ đổi cờ dòng lệnh sẽ làm mọi khôi lỗi hỏng cùng lúc, ở
+          # chỗ không ai nhìn. Nâng bản là một lượt sửa có chủ ý, đi kèm một lượt đo.
+          OBSCURA_VERSION: v0.2.1
+        run: |
+          set -eu
+          # Runner GitHub là x86_64; VM tông môn thì aarch64 — hai kiến trúc khác nhau, và tải
+          # nhầm thì binary nằm im cho tới lúc chạy mới nổ「Exec format error」.
+          asset="obscura-x86_64-linux-stealth.tar.gz"
+          dir="$RUNNER_TEMP/obscura"
+          mkdir -p "$dir"
+          curl -fsSL --retry 3 --retry-delay 2 -o "$dir/obscura.tar.gz"             "https://github.com/h4ckf0r0day/obscura/releases/download/$OBSCURA_VERSION/$asset"
+          tar -xzf "$dir/obscura.tar.gz" -C "$dir"
+          # Hỏi chính nó một câu trước khi tin: tệp đúng tên mà sai kiến trúc vẫn giải nén ngon lành.
+          "$dir/obscura" --version
+          echo "OBSCURA_BIN=$dir/obscura" >> "$GITHUB_ENV"
+
+      - name: Trực ca
+        env:
+          # Khôi lỗi là nguồn request dày nhất (mỗi 5 giây), nên đi thẳng backend thay vì đốt
+          # Edge Requests của một tài khoản Vercel Hobby. Ngày 08/09/2026 tám kho cùng bị kẹt
+          # khi auto-hh3d-4 chạm trần và mép Vercel trả 402 trước khi app kịp phát 409.
+          WEB_URL: ${{ vars.WEB_URL || 'https://158.180.59.36.sslip.io' }}
+          # Cổng thứ hai do operator tin cậy và nướng sẵn — worker KHÔNG lấy target từ Location
+          # hay thân lỗi. Nếu đường thẳng gặp lỗi mạng/gateway, lượt kế mới thử qua proxy này.
+          WORKER_FALLBACK_URL: ${{ vars.WORKER_FALLBACK_URL || 'https://auto-hh3d.vercel.app' }}
+          WORKER_TOKEN: ${{ secrets.WORKER_TOKEN }}
+          # Danh tính riêng — xem điều 1.
+          WORKER_ID: velvet-sentry
+          WORKER_MAX_JOBS: "2"
+          WORKER_QUEST_TABS: "3"
+          # 290 phút / 50 phút — xem điều 2. Viết bằng mili giây vì worker.mjs đọc thẳng.
+          WORKER_MAX_LIFETIME_MS: ${{ inputs.tuoi_tho_ms || '17400000' }}
+          WORKER_DRAIN_TIMEOUT_MS: "3000000"
+          # Tự bấm ô Turnstile khi vấp màn kiểm tra. Bật ở ĐÂY (chứ không đổi mặc định trong mã)
+          # vì cân nhắc đã đổi: đo 20/08/2026 thì cả bốn khôi lỗi tông môn đều bị chặn, `việc
+          # xong = 0` suốt ba giờ — không còn gì để mất. Lượt ghé cổng nay tự kể đã bấm mấy lần,
+          # nên bật xong là ĐO ĐƯỢC ngay trên Hoạt động chứ không phải đoán.
+          WORKER_SOLVE_TURNSTILE: "1"
+        run: |
+          set -eu
+          if [ -z "${WORKER_TOKEN:-}" ]; then
+            echo "::error::Thiếu secret WORKER_TOKEN — khôi lỗi không xác thực được với /api/worker."
+            exit 1
+          fi
+          node scripts/worker.mjs
+      # ── NỐI CHUỖI: lượt này tự phát lượt kế ────────────────────────────────────────────────
+      #
+      # Vì sao có bước này. Cron của GitHub KHÔNG mất nhịp (đo 22/08/2026: đủ 6 lượt/ngày) nhưng
+      # trễ 52–211 phút, tức dao động 159 phút. Ngân sách gối đầu chỉ là `tuổi thọ − chu kỳ cron`
+      # = 290 − 240 = 50 phút. Một dao động 159 phút không thể lọt qua khe 50 phút, nên đội hở
+      # lỗ đều đặn — đo được một lỗ 84 phút hôm 22/08.
+      #
+      # `GITHUB_TOKEN` DÙNG ĐƯỢC, không cần PAT. Luật chống đệ quy của GitHub chừa đúng hai cửa:
+      # "events triggered by the GITHUB_TOKEN will not create a new workflow run, with the
+      # following exceptions: workflow_dispatch and repository_dispatch events always create
+      # workflow runs". Nhờ vậy không phải nhét chìa `repo`+`workflow`+`delete_repo` vào kho.
+      #
+      # PHANH CHỐNG VÒNG LẶP — phần quan trọng nhất của bước này. Luật chống đệ quy kia sinh ra
+      # để chặn cảnh một lượt chết yểu lại phát lượt kế, chết yểu tiếp, đốt sạch phút Actions.
+      # Ta tự đi vòng qua luật ấy thì phải tự dựng phanh: CHỈ nối chuỗi khi lượt đã sống quá NỬA
+      # tuổi thọ. Ngưỡng suy từ chính `WORKER_MAX_LIFETIME_MS` chứ không gõ tay, nên hạ tuổi thọ
+      # xuống để thử là phanh tự hạ theo — không có hằng số nào trôi khỏi cấu hình.
+      #
+      # Cron ở trên GIỮ NGUYÊN làm lưới đỡ: chuỗi đứt (phát hỏng, lượt bị huỷ, lượt chết yểu) thì
+      # tối đa 4 giờ sau cron dựng lại đội. Bỏ cron đi là đổi một lỗ 84 phút lấy một lỗ vĩnh viễn.
+      - name: Phát lượt kế
+        if: always()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # Cùng biểu thức với bước trên — hai chỗ phải cùng đọc một con số, bằng không phanh
+          # canh theo tuổi thọ này mà worker sống theo tuổi thọ khác.
+          TUOI_THO_MS: ${{ inputs.tuoi_tho_ms || '17400000' }}
+        run: |
+          set -eu
+          troi=$(( $(date +%s) - BAT_DAU_LUC ))
+
+          if [ "${TUOI_THO_MS:-0}" -le 0 ]; then
+            echo "::warning::Không đọc được tuổi thọ (TUOI_THO_MS='${TUOI_THO_MS:-}') — không nối chuỗi, để cron đỡ."
+            exit 0
+          fi
+
+          nguong=$(( TUOI_THO_MS / 2000 ))
+          if [ "$troi" -lt "$nguong" ]; then
+            echo "Lượt này mới sống ${troi}s, chưa quá nửa tuổi thọ (${nguong}s) — KHÔNG nối chuỗi."
+            echo "Đây là phanh: một lượt chết yểu mà vẫn phát lượt kế là đốt phút Actions vô tận."
+            echo "Cron sẽ dựng lại đội trong tối đa 4 giờ."
+            exit 0
+          fi
+
+          # Tệp workflow trong kho khôi lỗi — khớp WORKFLOW_TARGET_PATH của scripts/githubKhoiloi.mts.
+          ma=$(curl -sS -o /tmp/noi-chuoi.out -w '%{http_code}' -X POST \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            "$GITHUB_API_URL/repos/$GITHUB_REPOSITORY/actions/workflows/upload-scheduler.yml/dispatches" \
+            -d "{\"ref\":\"$GITHUB_REF_NAME\"}") || ma=000
+
+          if [ "$ma" = "204" ]; then
+            echo "Đã phát lượt kế trên nhánh $GITHUB_REF_NAME (lượt này sống ${troi}s)."
+          else
+            echo "::error::Phát lượt kế HỎNG (HTTP $ma): $(head -c 300 /tmp/noi-chuoi.out 2>/dev/null || true)"
+            echo "::error::Chuỗi đứt — đội phải chờ cron tới 4 giờ. Soi quyền actions:write của GITHUB_TOKEN."
+            exit 1
+          fi
